@@ -1,0 +1,5 @@
+# Ignore data directories
+/data/raw/
+/data/processed/
+/tmp_dataset/
+__pycache__/
