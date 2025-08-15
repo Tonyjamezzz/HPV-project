@@ -1,36 +1,52 @@
 import argparse
 from pathlib import Path
+
 import torch
 from torch import nn, optim
 from torch.utils.data import DataLoader
-from torchvision import datasets, transforms, models
+from torchvision import datasets, transforms
 
-def get_dataloaders(data_dir: str, batch_size: int):
-    data_dir = Path(data_dir)
-    train_tfms = transforms.Compose([
-        transforms.RandomHorizontalFlip(),
-        transforms.RandomRotation(15),
-        transforms.ColorJitter(brightness=0.2),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.5]*3, std=[0.5]*3),
-    ])
-    test_tfms = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.5]*3, std=[0.5]*3),
-    ])
-    train_ds = datasets.ImageFolder(data_dir / 'train', transform=train_tfms)
-    val_ds = datasets.ImageFolder(data_dir / 'val', transform=test_tfms)
-    test_ds = datasets.ImageFolder(data_dir / 'test', transform=test_tfms)
+from models import SimpleCNN
 
-    return (
-        DataLoader(train_ds, batch_size=batch_size, shuffle=True),
-        DataLoader(val_ds, batch_size=batch_size),
-        DataLoader(test_ds, batch_size=batch_size),
+
+MODEL_REGISTRY = {"simplecnn": SimpleCNN}
+
+
+def get_dataloaders(data_dir: str, batch_size: int) -> tuple[DataLoader, DataLoader]:
+    """Prepare training and validation dataloaders."""
+    data_path = Path(data_dir)
+    train_tfms = transforms.Compose(
+        [
+            transforms.RandomHorizontalFlip(),
+            transforms.RandomRotation(15),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.5] * 3, std=[0.5] * 3),
+        ]
     )
+    val_tfms = transforms.Compose(
+        [
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.5] * 3, std=[0.5] * 3),
+        ]
+    )
+    train_ds = datasets.ImageFolder(data_path / "train", transform=train_tfms)
+    val_ds = datasets.ImageFolder(data_path / "val", transform=val_tfms)
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_ds, batch_size=batch_size)
+    return train_loader, val_loader
 
-def train_one_epoch(model, loader, criterion, optimizer, device):
+
+def train_one_epoch(
+    model: nn.Module,
+    loader: DataLoader,
+    criterion: nn.Module,
+    optimizer: optim.Optimizer,
+    device: torch.device,
+) -> tuple[float, float]:
+    """Train for a single epoch."""
     model.train()
     running_loss = 0.0
+    correct = 0
     for inputs, labels in loader:
         inputs, labels = inputs.to(device), labels.to(device)
         optimizer.zero_grad()
@@ -38,27 +54,69 @@ def train_one_epoch(model, loader, criterion, optimizer, device):
         loss = criterion(outputs, labels)
         loss.backward()
         optimizer.step()
-        running_loss += loss.item()
-    return running_loss / max(len(loader), 1)
+        running_loss += loss.item() * inputs.size(0)
+        preds = outputs.argmax(dim=1)
+        correct += (preds == labels).sum().item()
+    epoch_loss = running_loss / len(loader.dataset)
+    epoch_acc = correct / len(loader.dataset)
+    return epoch_loss, epoch_acc
 
-def main():
-    parser = argparse.ArgumentParser(description="Train simple classifier on processed cervical cell images")
-    parser.add_argument('--data-dir', default='data/processed')
-    parser.add_argument('--epochs', type=int, default=1)
-    parser.add_argument('--batch-size', type=int, default=32)
+
+def evaluate(
+    model: nn.Module, loader: DataLoader, criterion: nn.Module, device: torch.device
+) -> tuple[float, float]:
+    """Evaluate the model."""
+    model.eval()
+    running_loss = 0.0
+    correct = 0
+    with torch.no_grad():
+        for inputs, labels in loader:
+            inputs, labels = inputs.to(device), labels.to(device)
+            outputs = model(inputs)
+            loss = criterion(outputs, labels)
+            running_loss += loss.item() * inputs.size(0)
+            preds = outputs.argmax(dim=1)
+            correct += (preds == labels).sum().item()
+    epoch_loss = running_loss / len(loader.dataset)
+    epoch_acc = correct / len(loader.dataset)
+    return epoch_loss, epoch_acc
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Train a classifier on processed data")
+    parser.add_argument("--data-dir", default="data/processed")
+    parser.add_argument("--model", default="simplecnn", choices=MODEL_REGISTRY.keys())
+    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--lr", type=float, default=1e-3)
     args = parser.parse_args()
 
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    train_loader, val_loader, test_loader = get_dataloaders(args.data_dir, args.batch_size)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    train_loader, val_loader = get_dataloaders(args.data_dir, args.batch_size)
 
-    model = models.resnet18(weights=None, num_classes=len(train_loader.dataset.classes))
-    model.to(device)
+    num_classes = len(train_loader.dataset.classes)
+    model = MODEL_REGISTRY[args.model](num_classes=num_classes).to(device)
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=1e-3)
+    optimizer = optim.Adam(model.parameters(), lr=args.lr)
 
-    for epoch in range(args.epochs):
-        loss = train_one_epoch(model, train_loader, criterion, optimizer, device)
-        print(f"Epoch {epoch+1}/{args.epochs}, loss={loss:.4f}")
+    best_acc = 0.0
+    checkpoint_dir = Path("checkpoints")
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-if __name__ == '__main__':
+    for epoch in range(1, args.epochs + 1):
+        train_loss, train_acc = train_one_epoch(
+            model, train_loader, criterion, optimizer, device
+        )
+        val_loss, val_acc = evaluate(model, val_loader, criterion, device)
+        print(
+            f"Epoch {epoch}/{args.epochs} - "
+            f"train_loss: {train_loss:.4f}, train_acc: {train_acc:.4f}, "
+            f"val_loss: {val_loss:.4f}, val_acc: {val_acc:.4f}"
+        )
+        if val_acc > best_acc:
+            best_acc = val_acc
+            torch.save(model.state_dict(), checkpoint_dir / "best_model.pt")
+
+
+if __name__ == "__main__":
     main()
